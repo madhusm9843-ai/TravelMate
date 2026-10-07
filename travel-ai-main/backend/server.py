@@ -1,0 +1,849 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import os
+import re
+import math
+import json
+import logging
+import uuid
+import httpx
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+from typing import List, Optional, Any, Dict
+from datetime import datetime, timezone, timedelta
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017/')
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get('DB_NAME', 'test_database')]
+
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+logger = logging.getLogger("travelmate")
+
+# ---------- Rate limiter ----------
+limiter = Limiter(key_func=get_remote_address, default_limits=["600/hour"])
+
+app = FastAPI(title="TravelMate AI API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+api_router = APIRouter(prefix="/api")
+
+
+# ---------- Session dependency (SEC-001 mitigation) ----------
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{8,128}$")
+
+
+def require_session(x_session_id: Optional[str] = Header(default=None, alias="X-Session-Id")) -> str:
+    if not x_session_id or not SESSION_ID_RE.match(x_session_id):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Session-Id header")
+    return x_session_id
+
+
+# ---------- Input caps ----------
+MAX_MESSAGE_CHARS = 2000
+MAX_CONTEXT_CHARS = 3000
+MAX_NOTES_CHARS = 1000
+MAX_HISTORY_TURNS = 20
+
+
+# ---------- Models ----------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None  # optional in body — header is authoritative
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
+    context: Optional[Dict[str, Any]] = None
+
+    @field_validator("context")
+    @classmethod
+    def _cap_context(cls, v):
+        if v is None:
+            return v
+        # Cap serialized size
+        try:
+            if len(json.dumps(v)) > MAX_CONTEXT_CHARS:
+                return {"note": "context truncated"}
+        except Exception:
+            return None
+        return v
+
+
+class ChatMessage(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str
+    role: str  # 'user' | 'assistant'
+    content: str
+    timestamp: str = Field(default_factory=now_iso)
+
+
+class TripPreferences(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    session_id: Optional[str] = None  # header wins
+    destination: str = Field(..., min_length=1, max_length=120)
+    start_date: str
+    end_date: str
+    budget: int = Field(..., ge=500, le=10_000_000)
+    travelers: int = Field(2, ge=1, le=40)
+    interests: List[str] = []
+    travel_style: str = "balanced"
+    diet: str = "any"
+    include_festivals: bool = True
+    notes: str = Field("", max_length=MAX_NOTES_CHARS)
+
+
+class Trip(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str
+    title: str
+    destination: str
+    start_date: str
+    end_date: str
+    budget: int
+    travelers: int
+    preferences: Dict[str, Any]
+    itinerary: List[Dict[str, Any]] = []
+    created_at: str = Field(default_factory=now_iso)
+
+
+class BookingRequest(BaseModel):
+    session_id: Optional[str] = None  # header wins
+    type: str = Field(..., pattern=r"^(flight|train|bus|metro)$")
+    option_id: str = Field(..., min_length=1, max_length=64)
+    passenger_name: str = Field(..., min_length=1, max_length=120)
+    seat: Optional[str] = Field(None, max_length=16)
+    extras: Optional[Dict[str, Any]] = None
+
+
+class NearbyChatRequest(BaseModel):
+    session_id: Optional[str] = None
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    radius: Optional[int] = Field(1500, ge=100, le=8000)
+    category: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+
+# ---------- Destinations catalog ----------
+DESTINATIONS = [
+    # ---- India ----
+    {"id": "kerala", "region": "India", "name": "Kerala", "country": "India",
+     "tagline": "Backwaters, Hills & Coastal Charm", "days": "5 Days",
+     "image": "/destination-images/kerala-munnar.avif",
+     "lat": 10.8505, "lng": 76.2711,
+     "highlights": ["Alleppey Backwaters", "Munnar Tea Gardens", "Fort Kochi", "Wayanad"],
+     "best_season": "Sep – Mar"},
+    {"id": "goa", "region": "India", "name": "Goa", "country": "India",
+     "tagline": "Beaches, Cafés & Sunsets", "days": "3–4 Days",
+     "image": "/destination-images/goa.jpeg",
+     "lat": 15.2993, "lng": 74.1240,
+     "highlights": ["Palolem Beach", "Old Goa Churches", "Anjuna Flea Market", "Dudhsagar Falls"],
+     "best_season": "Nov – Feb"},
+    {"id": "rajasthan", "region": "India", "name": "Rajasthan", "country": "India",
+     "tagline": "Forts, Palaces & Desert Nights", "days": "6 Days",
+     "image": "/destination-images/rajasthan.jpg",
+     "lat": 26.9124, "lng": 75.7873,
+     "highlights": ["Jaipur City Palace", "Udaipur Lakes", "Jaisalmer Dunes", "Pushkar"],
+     "best_season": "Oct – Mar"},
+    {"id": "himachal", "region": "India", "name": "Himachal Pradesh", "country": "India",
+     "tagline": "Snow, Alpine Valleys & Villages", "days": "5 Days",
+     "image": "/destination-images/himachal-pradesh.jpeg",
+     "lat": 31.1048, "lng": 77.1734,
+     "highlights": ["Manali", "Spiti Valley", "Kasol", "Shimla"],
+     "best_season": "Mar – Jun & Oct – Feb"},
+    {"id": "tamilnadu", "region": "India", "name": "Tamil Nadu", "country": "India",
+     "tagline": "Temples, Coasts & Hill Stations", "days": "5 Days",
+     "image": "/destination-images/tamil-nadu.jpeg",
+     "lat": 11.1271, "lng": 78.6569,
+     "highlights": ["Madurai Meenakshi", "Pondicherry", "Ooty", "Mahabalipuram"],
+     "best_season": "Nov – Mar"},
+    {"id": "karnataka", "region": "India", "name": "Karnataka", "country": "India",
+     "tagline": "Palaces, Coffee Hills & Coastline", "days": "5 Days",
+     "image": "/destination-images/karnataka.jpeg",
+     "lat": 15.3173, "lng": 75.7139,
+     "highlights": ["Coorg", "Hampi", "Mysore Palace", "Gokarna"],
+     "best_season": "Oct – Mar"},
+    {"id": "ladakh", "region": "India", "name": "Ladakh", "country": "India",
+     "tagline": "Moonscapes, Monasteries & High-Altitude Lakes", "days": "7 Days",
+     "image": "/destination-images/ladakh.jpeg",
+     "lat": 34.1526, "lng": 77.5771,
+     "highlights": ["Pangong Tso", "Nubra Valley", "Leh Palace", "Magnetic Hill"],
+     "best_season": "May – Sep"},
+    {"id": "andaman", "region": "India", "name": "Andaman Islands", "country": "India",
+     "tagline": "Turquoise Waters & Coral Reefs", "days": "5 Days",
+     "image": "/destination-images/andaman.jpeg",
+     "lat": 11.7401, "lng": 92.6586,
+     "highlights": ["Radhanagar Beach", "Cellular Jail", "Havelock", "Neil Island"],
+     "best_season": "Oct – May"},
+    {"id": "uttarakhand", "region": "India", "name": "Uttarakhand", "country": "India",
+     "tagline": "Rishikesh, Rivers & Himalayan Trails", "days": "5 Days",
+     "image": "https://images.unsplash.com/photo-1626621341517-bbf3d9990a23?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 30.0668, "lng": 79.0193,
+     "highlights": ["Rishikesh", "Nainital", "Valley of Flowers", "Auli Skiing"],
+     "best_season": "Mar – Jun & Sep – Nov"},
+    {"id": "meghalaya", "region": "India", "name": "Meghalaya", "country": "India",
+     "tagline": "Living Root Bridges & Cloud Villages", "days": "5 Days",
+     "image": "/destination-images/meghalaya.jpeg",
+     "lat": 25.4670, "lng": 91.3662,
+     "highlights": ["Cherrapunji", "Dawki River", "Mawlynnong", "Nohkalikai Falls"],
+     "best_season": "Oct – May"},
+
+    # ---- International ----
+    {"id": "bali", "region": "International", "name": "Bali", "country": "Indonesia",
+     "tagline": "Rice Terraces, Beach Clubs & Temples", "days": "7 Days",
+     "image": "https://images.unsplash.com/photo-1537996194471-e657df975ab4?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": -8.3405, "lng": 115.0920,
+     "highlights": ["Ubud", "Uluwatu Temple", "Seminyak", "Nusa Penida"],
+     "best_season": "Apr – Oct"},
+    {"id": "tokyo", "region": "International", "name": "Tokyo", "country": "Japan",
+     "tagline": "Neon Nights, Sushi & Ancient Shrines", "days": "6 Days",
+     "image": "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 35.6762, "lng": 139.6503,
+     "highlights": ["Shibuya", "Asakusa", "Mount Fuji Day Trip", "TeamLab Planets"],
+     "best_season": "Mar – May & Sep – Nov"},
+    {"id": "paris", "region": "International", "name": "Paris", "country": "France",
+     "tagline": "Boulevards, Bistros & Boulangeries", "days": "5 Days",
+     "image": "https://images.unsplash.com/photo-1502602898657-3e91760cbb34?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 48.8566, "lng": 2.3522,
+     "highlights": ["Louvre", "Eiffel Tower", "Montmartre", "Versailles"],
+     "best_season": "Apr – Jun & Sep – Oct"},
+    {"id": "dubai", "region": "International", "name": "Dubai", "country": "UAE",
+     "tagline": "Skylines, Souks & Desert Safaris", "days": "4 Days",
+     "image": "https://images.unsplash.com/photo-1512453979798-5ea266f8880c?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 25.2048, "lng": 55.2708,
+     "highlights": ["Burj Khalifa", "Palm Jumeirah", "Old Dubai", "Desert Dunes"],
+     "best_season": "Nov – Mar"},
+    {"id": "iceland", "region": "International", "name": "Iceland", "country": "Iceland",
+     "tagline": "Glaciers, Geysers & Northern Lights", "days": "7 Days",
+     "image": "https://images.unsplash.com/photo-1520175480921-4edfa2983e0f?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 64.9631, "lng": -19.0208,
+     "highlights": ["Golden Circle", "Blue Lagoon", "Vík Beach", "Jökulsárlón"],
+     "best_season": "Sep – Mar (auroras)"},
+    {"id": "swiss-alps", "region": "International", "name": "Swiss Alps", "country": "Switzerland",
+     "tagline": "Peaks, Scenic Rails & Chocolate Villages", "days": "6 Days",
+     "image": "https://images.unsplash.com/photo-1531366936337-7c912a4589a7?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 46.5197, "lng": 7.9597,
+     "highlights": ["Interlaken", "Zermatt", "Jungfraujoch", "Lucerne"],
+     "best_season": "Jun – Sep & Dec – Feb"},
+    {"id": "phuket", "region": "International", "name": "Phuket", "country": "Thailand",
+     "tagline": "Emerald Bays, Longtails & Night Markets", "days": "5 Days",
+     "image": "https://images.unsplash.com/photo-1552465011-b4e21bf6e79a?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 7.8804, "lng": 98.3923,
+     "highlights": ["Phi Phi Islands", "Old Phuket Town", "Big Buddha", "James Bond Island"],
+     "best_season": "Nov – Apr"},
+    {"id": "singapore", "region": "International", "name": "Singapore", "country": "Singapore",
+     "tagline": "Gardens, Hawker Food & Skyparks", "days": "4 Days",
+     "image": "https://images.unsplash.com/photo-1525625293386-3f8f99389edd?crop=entropy&cs=srgb&fm=jpg&q=85",
+     "lat": 1.3521, "lng": 103.8198,
+     "highlights": ["Marina Bay", "Gardens by the Bay", "Sentosa", "Little India"],
+     "best_season": "Feb – Apr"},
+]
+
+
+# ---------- AI Helpers ----------
+SYSTEM_PROMPT = (
+    "You are TravelMate AI, a world-class travel concierge. "
+    "You craft hyper-personalized, day-by-day itineraries for destinations across India AND international hotspots "
+    "(Bali, Tokyo, Paris, Dubai, Iceland, Swiss Alps, Phuket, Singapore, etc.). "
+    "You share local secret gems, honest budget breakdowns in the traveller's currency, cultural festivals near travel dates, "
+    "food recommendations that respect dietary preferences, and practical transit tips (metro, bus, train, flight). "
+    "Answer in a warm, editorial tone. Use short paragraphs, bullet lists with '- ' or '• ', and **bold** for emphasis. "
+    "When asked for structured plans, respond in the requested JSON format only."
+)
+
+
+async def groq_chat(messages: List[Dict[str, str]], temperature: float = 0.6, json_mode: bool = False, max_tokens: int = 900) -> str:
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="AI service is temporarily unavailable")
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=90) as hc:
+            r = await hc.post(GROQ_URL, json=payload, headers=headers)
+    except Exception:
+        logger.exception("Groq network error")
+        raise HTTPException(status_code=502, detail="AI service temporarily unavailable")
+    if r.status_code != 200:
+        # Never echo upstream body to clients (SEC-003)
+        logger.warning("Groq upstream %s: %s", r.status_code, r.text[:400])
+        raise HTTPException(status_code=502, detail="AI service temporarily unavailable")
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+# ---------- Routes ----------
+@api_router.get("/")
+async def root():
+    return {"service": "TravelMate AI", "status": "ok"}
+
+
+@api_router.get("/destinations")
+async def list_destinations():
+    return DESTINATIONS
+
+
+@api_router.get("/destinations/{dest_id}")
+async def get_destination(dest_id: str):
+    for d in DESTINATIONS:
+        if d["id"] == dest_id:
+            return d
+    raise HTTPException(404, "Destination not found")
+
+
+@api_router.post("/chat")
+@limiter.limit("30/minute")
+async def chat(request: Request, req: ChatRequest, sid: str = Depends(require_session)):
+    # Load recent history for this session (from header — SEC-001)
+    history_docs = await db.chat_messages.find(
+        {"session_id": sid}, {"_id": 0}
+    ).sort("timestamp", 1).to_list(MAX_HISTORY_TURNS * 2)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if req.context:
+        ctx_text = "Current trip context: " + json.dumps(req.context)[:1500]
+        messages.append({"role": "system", "content": ctx_text})
+    for m in history_docs[-MAX_HISTORY_TURNS:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": req.message})
+
+    user_msg = ChatMessage(session_id=sid, role="user", content=req.message)
+    await db.chat_messages.insert_one(user_msg.model_dump())
+
+    reply = await groq_chat(messages, temperature=0.7)
+
+    assistant_msg = ChatMessage(session_id=sid, role="assistant", content=reply)
+    await db.chat_messages.insert_one(assistant_msg.model_dump())
+
+    return {"reply": reply, "message_id": assistant_msg.id}
+
+
+@api_router.post("/chat/stream")
+@limiter.limit("30/minute")
+async def chat_stream(request: Request, req: ChatRequest, sid: str = Depends(require_session)):
+    """SSE streaming endpoint — yields token-by-token like ChatGPT/Claude."""
+    history_docs = await db.chat_messages.find(
+        {"session_id": sid}, {"_id": 0}
+    ).sort("timestamp", 1).to_list(MAX_HISTORY_TURNS * 2)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if req.context:
+        messages.append({"role": "system", "content": "Current trip context: " + json.dumps(req.context)[:1500]})
+    for m in history_docs[-MAX_HISTORY_TURNS:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": req.message})
+
+    user_msg = ChatMessage(session_id=sid, role="user", content=req.message)
+    await db.chat_messages.insert_one(user_msg.model_dump())
+
+    assistant_id = str(uuid.uuid4())
+
+    async def event_gen():
+        yield f"event: start\ndata: {json.dumps({'message_id': assistant_id})}\n\n"
+        buffer_text = ""
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 900,
+            "stream": True,
+        }
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=120) as hc:
+                async with hc.stream("POST", GROQ_URL, json=payload, headers=headers) as r:
+                    if r.status_code != 200:
+                        err_body = (await r.aread()).decode(errors="ignore")[:300]
+                        logger.warning("Groq stream upstream %s: %s", r.status_code, err_body)
+                        yield f"event: error\ndata: {json.dumps({'error': 'AI service temporarily unavailable'})}\n\n"
+                        return
+                    async for line in r.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data)
+                            delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta:
+                                buffer_text += delta
+                                yield f"data: {json.dumps({'delta': delta})}\n\n"
+                        except Exception:
+                            continue
+        except Exception:
+            logger.exception("Groq stream error")
+            yield f"event: error\ndata: {json.dumps({'error': 'AI stream error'})}\n\n"
+
+        # persist final message
+        if buffer_text:
+            assistant_msg = ChatMessage(id=assistant_id, session_id=sid, role="assistant", content=buffer_text)
+            await db.chat_messages.insert_one(assistant_msg.model_dump())
+        yield f"event: done\ndata: {json.dumps({'message_id': assistant_id})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@api_router.get("/chat")
+async def chat_history(sid: str = Depends(require_session)):
+    docs = await db.chat_messages.find(
+        {"session_id": sid}, {"_id": 0}
+    ).sort("timestamp", 1).to_list(200)
+    return docs
+
+
+@api_router.delete("/chat")
+async def clear_chat(sid: str = Depends(require_session)):
+    await db.chat_messages.delete_many({"session_id": sid})
+    return {"ok": True}
+
+
+# ---------- Nearby POI search via OpenStreetMap Overpass ----------
+CATEGORY_FILTER = {
+    "hotel": '["tourism"~"^(hotel|hostel|guest_house|motel|apartment)$"]',
+    "restaurant": '["amenity"~"^(restaurant|fast_food|food_court)$"]',
+    "cafe": '["amenity"~"^(cafe|bar|pub|ice_cream)$"]',
+    "attraction": '["tourism"~"^(attraction|museum|viewpoint|artwork|zoo|theme_park|gallery)$"]',
+    "atm": '["amenity"~"^(atm|bank)$"]',
+    "hospital": '["amenity"~"^(hospital|pharmacy|clinic)$"]',
+    "fuel": '["amenity"="fuel"]',
+    "shopping": '["shop"]',
+}
+
+NEARBY_KEYWORDS = re.compile(
+    r"\b(near\s?me|nearby|near\s?by|close\s?by|around\s?(me|here)|within|walking distance)\b",
+    re.I,
+)
+
+
+def infer_category(text: str) -> Optional[str]:
+    t = text.lower()
+    if re.search(r"\b(hotel|stay|resort|hostel|lodge|guest\s?house|motel|room)s?\b", t):
+        return "hotel"
+    if re.search(r"\b(restaurant|dine|dining|eatery|thali|lunch|dinner|meal|street\s?food|food|eat(s|ing)?)\b", t):
+        return "restaurant"
+    if re.search(r"\b(caf[eé]|coffee|bar|pub|breakfast|dessert|ice\s?cream)s?\b", t):
+        return "cafe"
+    if re.search(r"\b(attraction|tourist|monument|museum|viewpoint|temple|church|beach|park|spot)s?\b", t):
+        return "attraction"
+    if re.search(r"\b(atm|bank)s?\b", t):
+        return "atm"
+    if re.search(r"\b(hospital|pharmacy|clinic|medical)\b", t):
+        return "hospital"
+    if re.search(r"\b(fuel|petrol|gas|diesel)\s?(pump|station)?\b", t):
+        return "fuel"
+    if re.search(r"\b(shop|mall|market|store)s?\b", t):
+        return "shopping"
+    return None
+
+
+def _haversine(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
+    R = 6371000.0
+    p1 = math.radians(a_lat); p2 = math.radians(b_lat)
+    dp = math.radians(b_lat - a_lat); dl = math.radians(b_lng - a_lng)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _photo_for(category: str, name: str) -> str:
+    kw = (name.split(",")[0]).strip().replace(" ", ",")
+    slug = f"{category},{kw}" if kw else category
+    return f"https://source.unsplash.com/400x300/?{slug}"
+
+
+OVERPASS_MIRRORS = [
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.osm.jp/api/interpreter",
+]
+
+
+async def overpass_nearby(lat: float, lng: float, category: str, radius: int = 1500, limit: int = 12) -> List[Dict[str, Any]]:
+    q_filter = CATEGORY_FILTER.get(category, '["tourism"]')
+    query = f"""[out:json][timeout:20];
+(
+  node{q_filter}(around:{radius},{lat},{lng});
+  way{q_filter}(around:{radius},{lat},{lng});
+);
+out center 40;"""
+    elements: List[Dict[str, Any]] = []
+    for url in OVERPASS_MIRRORS:
+        try:
+            async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "TravelMateAI/1.0"}) as hc:
+                r = await hc.post(url, data={"data": query})
+                if r.status_code == 200:
+                    elements = r.json().get("elements", [])
+                    if elements is not None:
+                        break
+        except Exception as e:
+            logging.info(f"Overpass mirror {url} failed: {type(e).__name__}")
+            continue
+
+    results: List[Dict[str, Any]] = []
+    for e in elements:
+        tags = e.get("tags", {})
+        name = tags.get("name") or tags.get("brand")
+        if not name:
+            continue
+        elat = e.get("lat") or e.get("center", {}).get("lat")
+        elng = e.get("lon") or e.get("center", {}).get("lon")
+        if not elat or not elng:
+            continue
+        dist = _haversine(lat, lng, elat, elng)
+        results.append({
+            "name": name,
+            "lat": elat, "lng": elng,
+            "distance_m": round(dist),
+            "category": category,
+            "cuisine": tags.get("cuisine"),
+            "stars": tags.get("stars"),
+            "phone": tags.get("phone") or tags.get("contact:phone"),
+            "website": tags.get("website") or tags.get("contact:website"),
+            "address": tags.get("addr:street") or tags.get("addr:full") or tags.get("addr:city") or "",
+            "photo": _photo_for(category, name),
+            "osm_url": f"https://www.openstreetmap.org/?mlat={elat}&mlon={elng}#map=18/{elat}/{elng}",
+        })
+    results.sort(key=lambda x: x["distance_m"])
+    return results[:limit]
+
+
+@api_router.get("/nearby")
+@limiter.limit("60/minute")
+async def nearby(request: Request, lat: float, lng: float, category: str = "attraction", radius: int = 1500):
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        raise HTTPException(400, "lat/lng out of range")
+    radius = max(100, min(int(radius), 8000))
+    if category not in CATEGORY_FILTER:
+        raise HTTPException(400, "Invalid category")
+    pois = await overpass_nearby(lat, lng, category, radius=radius)
+    return {"category": category, "count": len(pois), "results": pois}
+
+
+@api_router.post("/chat/nearby")
+@limiter.limit("30/minute")
+async def chat_nearby(request: Request, req: NearbyChatRequest, sid: str = Depends(require_session)):
+    """Location-aware chat: fetches nearby POIs from OpenStreetMap, then answers with the LLM using them as context."""
+    category = req.category or infer_category(req.message) or "attraction"
+    if category not in CATEGORY_FILTER:
+        category = "attraction"
+    pois = await overpass_nearby(req.lat, req.lng, category, radius=req.radius or 1500, limit=8)
+
+    poi_context = "\n".join([
+        f"- {p['name']} ({p['category']}, {p['distance_m']}m away) "
+        f"{'· ' + p['cuisine'] if p.get('cuisine') else ''}"
+        f"{'· ★' + p['stars'] if p.get('stars') else ''}"
+        for p in pois
+    ]) or "No POIs returned from the OpenStreetMap search."
+
+    history = await db.chat_messages.find({"session_id": sid}, {"_id": 0}).sort("timestamp", 1).to_list(20)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content":
+            f"The traveller is at latitude {req.lat}, longitude {req.lng}. "
+            f"You just ran a live OpenStreetMap search for {category}s within {req.radius}m. Results:\n{poi_context}\n"
+            f"Ground your recommendations in these results. Reference by name. Include distance. "
+            f"Use bullet lists. Keep it concise (max ~180 words). If results are empty, tell the user honestly and suggest broader search."
+        },
+    ]
+    for m in history[-14:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": req.message})
+
+    await db.chat_messages.insert_one(ChatMessage(session_id=sid, role="user", content=req.message).model_dump())
+    reply = await groq_chat(messages, temperature=0.6)
+    asst = ChatMessage(session_id=sid, role="assistant", content=reply)
+    await db.chat_messages.insert_one(asst.model_dump())
+    return {"reply": reply, "message_id": asst.id, "category": category, "pois": pois}
+
+
+
+
+
+@api_router.post("/itinerary/generate")
+@limiter.limit("10/minute")
+async def generate_itinerary(request: Request, prefs: TripPreferences, sid: str = Depends(require_session)):
+    # Compute # days
+    try:
+        d1 = datetime.fromisoformat(prefs.start_date)
+        d2 = datetime.fromisoformat(prefs.end_date)
+        num_days = max(1, (d2 - d1).days + 1)
+    except Exception:
+        num_days = 5
+    num_days = min(num_days, 30)
+
+    ask = f"""Craft a detailed {num_days}-day itinerary for {prefs.destination}, India.
+Traveler profile:
+- Travelers: {prefs.travelers}
+- Budget (total INR): {prefs.budget}
+- Interests: {', '.join(prefs.interests) or 'general sightseeing'}
+- Travel style: {prefs.travel_style}
+- Dietary preference: {prefs.diet}
+- Include cultural festivals near dates {prefs.start_date} to {prefs.end_date}: {prefs.include_festivals}
+- Additional notes: {prefs.notes or 'none'}
+
+CRITICAL: The "days" array MUST contain EXACTLY {num_days} objects, one per day (day 1 through day {num_days}). Do NOT return fewer or more days.
+
+Return STRICT JSON with this shape:
+{{
+  "title": "string",
+  "summary": "1-2 sentence overview",
+  "budget_breakdown": {{"stay": int, "food": int, "transit": int, "activities": int, "buffer": int}},
+  "festivals": [{{"name": "string", "date": "YYYY-MM-DD", "place": "string"}}],
+  "days": [
+    {{
+      "day": 1,
+      "title": "string",
+      "stops": [
+        {{"time": "09:00 AM", "kind": "Attraction & Nature Walk", "name": "string",
+          "description": "string", "lat": 0.0, "lng": 0.0, "cost_inr": 0}}
+      ]
+    }}
+  ]
+}}
+Each day must have 3-5 stops with realistic lat/lng inside India. Costs sum roughly to the budget.
+The "days" array length MUST equal {num_days}.
+"""
+    raw = await groq_chat(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT + " You MUST return valid JSON only."},
+            {"role": "user", "content": ask},
+        ],
+        temperature=0.6,
+        json_mode=True,
+    )
+    try:
+        plan = json.loads(raw)
+    except Exception:
+        cleaned = raw.strip().strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+        plan = json.loads(cleaned)
+
+    # Post-process: guarantee days length == num_days by padding with a light day if AI shortchanged us
+    days_out = plan.get("days") or []
+    while len(days_out) < num_days:
+        idx = len(days_out) + 1
+        days_out.append({
+            "day": idx,
+            "title": f"Day {idx} · Free Exploration",
+            "stops": [
+                {"time": "10:00 AM", "kind": "Flex Day", "name": f"Open exploration in {prefs.destination}",
+                 "description": "Reserved buffer day — swap in extra stops using the AI concierge.",
+                 "lat": 0, "lng": 0, "cost_inr": 0},
+            ],
+        })
+    plan["days"] = days_out[:num_days]
+
+    trip = Trip(
+        session_id=sid,
+        title=plan.get("title", f"{prefs.destination} Escape"),
+        destination=prefs.destination,
+        start_date=prefs.start_date,
+        end_date=prefs.end_date,
+        budget=prefs.budget,
+        travelers=prefs.travelers,
+        preferences={**prefs.model_dump(), "session_id": sid},
+        itinerary=[plan],
+    )
+    await db.trips.insert_one(trip.model_dump())
+    return trip
+
+
+@api_router.get("/trips")
+async def list_trips(sid: str = Depends(require_session)):
+    docs = await db.trips.find({"session_id": sid}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return docs
+
+
+@api_router.get("/trips/{trip_id}")
+async def get_trip(trip_id: str, sid: str = Depends(require_session)):
+    doc = await db.trips.find_one({"id": trip_id, "session_id": sid}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Trip not found")
+    return doc
+
+
+@api_router.delete("/trips/{trip_id}")
+async def delete_trip(trip_id: str, sid: str = Depends(require_session)):
+    res = await db.trips.delete_one({"id": trip_id, "session_id": sid})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Trip not found")
+    return {"ok": True}
+
+
+# ---------- Simulated Booking ----------
+def _mock_flights(origin: str, destination: str, date: str):
+    airlines = ["IndiGo", "Vistara", "Air India", "SpiceJet", "Akasa Air"]
+    times = [("06:15", "08:45"), ("09:30", "12:00"), ("13:45", "16:20"), ("18:10", "20:35"), ("22:00", "00:35")]
+    out = []
+    for i, (dep, arr) in enumerate(times):
+        out.append({
+            "id": f"FL-{i+1}", "airline": airlines[i], "flight_no": f"{airlines[i][:2].upper()}{100+i*23}",
+            "depart": dep, "arrive": arr, "duration": "2h 30m",
+            "price": 3200 + i * 450, "stops": 0 if i % 2 == 0 else 1,
+            "origin": origin, "destination": destination, "date": date,
+        })
+    return out
+
+
+def _mock_trains(origin: str, destination: str, date: str):
+    names = ["Rajdhani Exp", "Shatabdi Exp", "Vande Bharat", "Duronto", "Tejas"]
+    out = []
+    for i, n in enumerate(names):
+        out.append({
+            "id": f"TR-{i+1}", "name": n, "number": f"122{i+10}",
+            "depart": ["06:00", "08:30", "14:20", "17:50", "22:10"][i],
+            "arrive": ["14:20", "16:15", "22:05", "07:40", "10:20"][i],
+            "duration": ["8h 20m", "7h 45m", "7h 45m", "13h 50m", "12h 10m"][i],
+            "class": ["3AC", "CC", "EC", "2AC", "3AC"][i],
+            "price": [1450, 980, 2200, 2650, 1580][i],
+            "origin": origin, "destination": destination, "date": date,
+        })
+    return out
+
+
+def _mock_buses(origin: str, destination: str, date: str):
+    operators = ["VRL Travels", "SRS Travels", "RedBus Sleeper", "Kallada AC", "Orange Tours"]
+    out = []
+    for i, o in enumerate(operators):
+        out.append({
+            "id": f"BS-{i+1}", "operator": o, "bus_type": ["AC Sleeper", "Non-AC Seater", "Volvo Multi-Axle", "AC Semi-Sleeper", "Sleeper"][i],
+            "depart": ["20:30", "21:15", "22:00", "22:45", "23:30"][i],
+            "arrive": ["06:00", "07:30", "08:10", "09:15", "10:20"][i],
+            "duration": ["9h 30m", "10h 15m", "10h 10m", "10h 30m", "10h 50m"][i],
+            "price": [780, 550, 1250, 890, 620][i],
+            "origin": origin, "destination": destination, "date": date,
+        })
+    return out
+
+
+def _mock_metro(origin: str, destination: str):
+    return [
+        {"id": "MT-1", "line": "Purple Line", "depart": "Now + 3 min",
+         "duration": "22 min", "changes": 0, "fare": 40,
+         "origin": origin, "destination": destination},
+        {"id": "MT-2", "line": "Green + Purple", "depart": "Now + 6 min",
+         "duration": "28 min", "changes": 1, "fare": 45,
+         "origin": origin, "destination": destination},
+    ]
+
+
+@api_router.get("/transport/search")
+async def transport_search(type: str, origin: str, destination: str, date: str = ""):
+    if len(origin) > 60 or len(destination) > 60 or len(date) > 32:
+        raise HTTPException(400, "input too long")
+    t = type.lower()
+    if t == "flight":
+        return {"type": t, "options": _mock_flights(origin, destination, date)}
+    if t == "train":
+        return {"type": t, "options": _mock_trains(origin, destination, date)}
+    if t == "bus":
+        return {"type": t, "options": _mock_buses(origin, destination, date)}
+    if t == "metro":
+        return {"type": t, "options": _mock_metro(origin, destination)}
+    raise HTTPException(400, "type must be flight | train | bus | metro")
+
+
+@api_router.post("/bookings")
+async def create_booking(req: BookingRequest, sid: str = Depends(require_session)):
+    booking = {
+        "id": str(uuid.uuid4()),
+        "session_id": sid,
+        "type": req.type,
+        "option_id": req.option_id,
+        "passenger_name": req.passenger_name,
+        "seat": req.seat or f"S{uuid.uuid4().hex[:3].upper()}",
+        "status": "CONFIRMED",
+        "pnr": f"TM{uuid.uuid4().hex[:6].upper()}",
+        "extras": req.extras or {},
+        "created_at": now_iso(),
+    }
+    await db.bookings.insert_one(booking)
+    booking.pop("_id", None)
+    return booking
+
+
+@api_router.get("/bookings")
+async def list_bookings(sid: str = Depends(require_session)):
+    docs = await db.bookings.find({"session_id": sid}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return docs
+
+
+# ---------- Cultural festivals near date (AI backed, cached) ----------
+@api_router.get("/festivals")
+@limiter.limit("30/minute")
+async def festivals(request: Request, destination: str, date: str):
+    if len(destination) > 60 or len(date) > 32:
+        raise HTTPException(400, "input too long")
+    key = f"{destination.lower()}::{date}"
+    cached = await db.festivals_cache.find_one({"key": key}, {"_id": 0})
+    if cached:
+        return cached["value"]
+    ask = (
+        f"List up to 5 cultural or religious festivals happening in or near {destination}, India within 14 days of "
+        f"{date}. Return STRICT JSON: {{\"festivals\": [{{\"name\": str, \"date\": \"YYYY-MM-DD\", \"place\": str, "
+        f"\"summary\": str}}]}}. If none, return empty list."
+    )
+    raw = await groq_chat(
+        [{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": ask}],
+        temperature=0.3, json_mode=True, max_tokens=600,
+    )
+    try:
+        val = json.loads(raw)
+    except Exception:
+        val = {"festivals": []}
+    await db.festivals_cache.insert_one({"key": key, "value": val, "cached_at": now_iso()})
+    return val
+
+
+app.include_router(api_router)
+
+
+def _parse_origins(raw: str) -> List[str]:
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    return parts or ["*"]
+
+
+_configured_origins = _parse_origins(os.environ.get("CORS_ORIGINS", "*"))
+# When wildcard is present, credentials must be disabled per browser spec — avoid CWE-942 misconfig
+_allow_credentials = "*" not in _configured_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=_allow_credentials,
+    allow_origins=_configured_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Session-Id"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
